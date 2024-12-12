@@ -25,8 +25,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
-	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -38,9 +36,10 @@ import (
 )
 
 const (
-	readTimeout  = time.Minute
-	writeTimeout = 30 * time.Second
-	pingInterval = 20 * time.Second
+	readTimeout         = time.Minute
+	writeTimeout        = 30 * time.Second
+	pingInterval        = 20 * time.Second
+	defaultAttemptReset = time.Minute * 30
 )
 
 func convertOrders(ol []*order) (map[string]order, error) {
@@ -61,9 +60,11 @@ type orderList []luno.OrderBookEntry
 func (ol orderList) Less(i, j int) bool {
 	return ol[i].Price.Cmp(ol[j].Price) < 0
 }
+
 func (ol orderList) Swap(i, j int) {
 	ol[i], ol[j] = ol[j], ol[i]
 }
+
 func (ol orderList) Len() int {
 	return len(ol)
 }
@@ -89,17 +90,36 @@ func flatten(m map[string]order, reverse bool) []luno.OrderBookEntry {
 	} else {
 		sort.Sort(orderList(ol))
 	}
-	return ol
+	ret := make([]luno.OrderBookEntry, 0, len(ol))
+	for _, o := range ol {
+		if len(ret) == 0 {
+			ret = append(ret, o)
+			continue
+		}
+		lastIdx := len(ret) - 1
+		if o.Price.Cmp(ret[lastIdx].Price) == 0 {
+			ret[lastIdx].Volume = ret[lastIdx].Volume.Add(o.Volume)
+			continue
+		}
+		ret = append(ret, o)
+	}
+	return ret
 }
 
-type ConnectCallback func(*Conn)
-type UpdateCallback func(Update)
+type (
+	ConnectCallback func(*Conn)
+	UpdateCallback  func(Update)
+	BackoffHandler  func(attempt int) time.Duration
+)
 
 type Conn struct {
 	keyID, keySecret string
 	pair             string
 	connectCallback  ConnectCallback
 	updateCallback   UpdateCallback
+
+	backoffHandler BackoffHandler
+	attemptReset   time.Duration
 
 	closed bool
 
@@ -123,9 +143,10 @@ func Dial(keyID, keySecret, pair string, opts ...DialOption) (*Conn, error) {
 	}
 
 	c := &Conn{
-		keyID:     keyID,
-		keySecret: keySecret,
-		pair:      pair,
+		keyID:        keyID,
+		keySecret:    keySecret,
+		pair:         pair,
+		attemptReset: defaultAttemptReset,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -139,11 +160,9 @@ var wsHost = flag.String(
 	"luno_websocket_host", "wss://ws.luno.com", "Luno API websocket host")
 
 func (c *Conn) manageForever() {
-	attempts := 0
-	var lastAttempt time.Time
+	p := &backoffParams{}
+
 	for {
-		lastAttempt = time.Now()
-		attempts++
 		if err := c.connect(); err != nil {
 			log.Printf("luno/streaming: Connection error key=%s pair=%s: %v",
 				c.keyID, c.pair, err)
@@ -152,15 +171,28 @@ func (c *Conn) manageForever() {
 			return
 		}
 
-		if time.Now().Sub(lastAttempt) > 30*time.Minute {
-			attempts = 0
-		}
-		jitter := time.Duration(rand.Intn(200)-100) * time.Millisecond                       // ±100ms
-		backoff := time.Duration(math.Min(math.Pow(2, float64(attempts)), 60)) * time.Second // Exponential backoff up to 60s
-		dt := backoff + jitter
+		dt := c.calculateBackoff(p, time.Now())
+
 		log.Printf("luno/streaming: Waiting %s before reconnecting", dt)
 		time.Sleep(dt)
 	}
+}
+
+func (c *Conn) calculateBackoff(p *backoffParams, ts time.Time) time.Duration {
+	if ts.Sub(p.lastAttempt) >= c.attemptReset {
+		p.attempts = 0
+	}
+
+	p.attempts++
+
+	backoff := defaultBackoffHandler
+	if c.backoffHandler != nil {
+		backoff = c.backoffHandler
+	}
+
+	p.lastAttempt = ts
+
+	return backoff(p.attempts)
 }
 
 func (c *Conn) connect() error {
@@ -285,51 +317,15 @@ func (c *Conn) receivedOrderBook(ob orderBook) error {
 }
 
 func (c *Conn) receivedUpdate(u Update) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	valid, err := c.processUpdate(u)
+	if err != nil {
+		return err
+	}
 
-	if c.seq == 0 {
-		// State not initialized so we can't update it.
+	// If update is not valid, ignore
+	if !valid {
 		return nil
 	}
-
-	if u.Sequence <= c.seq {
-		// Old update. We can just discard it.
-		return nil
-	}
-	if u.Sequence != c.seq+1 {
-		return errors.New("streaming: update received out of sequence")
-	}
-
-	// Process trades
-	for _, t := range u.TradeUpdates {
-		if err := c.processTrade(*t); err != nil {
-			return err
-		}
-	}
-
-	// Process create
-	if u.CreateUpdate != nil {
-		if err := c.processCreate(*u.CreateUpdate); err != nil {
-			return err
-		}
-	}
-
-	// Process delete
-	if u.DeleteUpdate != nil {
-		if err := c.processDelete(*u.DeleteUpdate); err != nil {
-			return err
-		}
-	}
-
-	// Process status
-	if u.StatusUpdate != nil {
-		if err := c.processStatus(*u.StatusUpdate); err != nil {
-			return err
-		}
-	}
-
-	c.seq = u.Sequence
 
 	if c.updateCallback != nil {
 		c.updateCallback(u)
@@ -338,9 +334,62 @@ func (c *Conn) receivedUpdate(u Update) error {
 	return nil
 }
 
-func decTrade(m map[string]order, id string, base decimal.Decimal) (
-	bool, error) {
+// Validate and process update into orderbook.
+// Return bool indicating if update is valid.
+func (c *Conn) processUpdate(u Update) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	if c.seq == 0 {
+		// State not initialized so we can't update it.
+		return false, nil
+	}
+
+	if u.Sequence <= c.seq {
+		// Old update. We can just discard it.
+		return false, nil
+	}
+
+	if u.Sequence != c.seq+1 {
+		return false, errors.New("streaming: update received out of sequence")
+	}
+
+	// Process trades
+	for _, t := range u.TradeUpdates {
+		if err := c.processTrade(*t); err != nil {
+			return false, err
+		}
+	}
+
+	// Process create
+	if u.CreateUpdate != nil {
+		if err := c.processCreate(*u.CreateUpdate); err != nil {
+			return false, err
+		}
+	}
+
+	// Process delete
+	if u.DeleteUpdate != nil {
+		if err := c.processDelete(*u.DeleteUpdate); err != nil {
+			return false, err
+		}
+	}
+
+	// Process status
+	if u.StatusUpdate != nil {
+		if err := c.processStatus(*u.StatusUpdate); err != nil {
+			return false, err
+		}
+	}
+
+	c.seq = u.Sequence
+
+	return true, nil
+}
+
+func decTrade(m map[string]order, id string, base decimal.Decimal) (
+	bool, error,
+) {
 	o, ok := m[id]
 	if !ok {
 		return false, nil
@@ -366,11 +415,15 @@ func (c *Conn) processTrade(t TradeUpdate) error {
 	}
 
 	c.lastTrade = TradeUpdate{
-		Base:    t.Base,
-		Counter: t.Counter,
+		Sequence:     t.Sequence,
+		Base:         t.Base,
+		Counter:      t.Counter,
+		MakerOrderID: t.MakerOrderID,
+		TakerOrderID: t.TakerOrderID,
+		OrderID:      t.OrderID,
 	}
 
-	ok, err := decTrade(c.bids, t.OrderID, t.Base)
+	ok, err := decTrade(c.bids, t.MakerOrderID, t.Base)
 	if err != nil {
 		return err
 	}
@@ -378,7 +431,7 @@ func (c *Conn) processTrade(t TradeUpdate) error {
 		return nil
 	}
 
-	ok, err = decTrade(c.asks, t.OrderID, t.Base)
+	ok, err = decTrade(c.asks, t.MakerOrderID, t.Base)
 	if err != nil {
 		return err
 	}
@@ -395,11 +448,14 @@ func (c *Conn) processCreate(u CreateUpdate) error {
 		Volume: u.Volume,
 	}
 
-	if u.Type == string(luno.OrderTypeBid) {
+	switch u.Type {
+	case string(luno.OrderTypeBid):
 		c.bids[o.ID] = o
-	} else if u.Type == string(luno.OrderTypeAsk) {
+
+	case string(luno.OrderTypeAsk):
 		c.asks[o.ID] = o
-	} else {
+
+	default:
 		return errors.New("streaming: unknown order type")
 	}
 
@@ -429,8 +485,8 @@ func (c *Conn) processStatus(u StatusUpdate) error {
 // OrderBookSnapshot returns the latest order book.
 // Deprecated at v0.0.8, use Snapshot().
 func (c *Conn) OrderBookSnapshot() (
-	int64, []luno.OrderBookEntry, []luno.OrderBookEntry) {
-
+	int64, []luno.OrderBookEntry, []luno.OrderBookEntry,
+) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -460,7 +516,7 @@ func (c *Conn) Snapshot() Snapshot {
 	}
 }
 
-// Status returns the currenct status of the streaming connection.
+// Status returns the current status of the streaming connection.
 func (c *Conn) Status() luno.Status {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -468,7 +524,7 @@ func (c *Conn) Status() luno.Status {
 	return c.status
 }
 
-// Close the stream. After calling this the client will stop receiving new updates and the results of querying the Conn
+// Close the stream. After calling this, the client will stop receiving new updates and the results of querying the Conn
 // struct (Snapshot, Status...) will be zeroed values.
 func (c *Conn) Close() {
 	c.mu.Lock()

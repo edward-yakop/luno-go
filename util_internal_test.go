@@ -8,7 +8,6 @@ import (
 )
 
 func TestMakeURLValues(t *testing.T) {
-
 	type S string
 
 	type Req struct {
