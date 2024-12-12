@@ -25,10 +25,26 @@ type AccountBalance struct {
 	Unconfirmed decimal.Decimal `json:"unconfirmed"`
 }
 
+type AccountType string
+
+const (
+	AccountTypeCurrentcheque AccountType = "Current/Cheque"
+	AccountTypeSavings       AccountType = "Savings"
+	AccountTypeTransmission  AccountType = "Transmission"
+)
+
 type AddressMeta struct {
 	Label string `json:"label"`
 	Value string `json:"value"`
 }
+
+type BankAccountType string
+
+const (
+	BankAccountTypeCurrentcheque BankAccountType = "Current/Cheque"
+	BankAccountTypeSavings       BankAccountType = "Savings"
+	BankAccountTypeTransmission  BankAccountType = "Transmission"
+)
 
 type Candle struct {
 	// Closing price
@@ -97,10 +113,10 @@ type FundsMove struct {
 type Kind string
 
 const (
-	KindFee      Kind = "FEE"
-	KindTransfer Kind = "TRANSFER"
 	KindExchange Kind = "EXCHANGE"
+	KindFee      Kind = "FEE"
 	KindInterest Kind = "INTEREST"
+	KindTransfer Kind = "TRANSFER"
 )
 
 type MarketInfo struct {
@@ -140,6 +156,8 @@ type MarketInfo struct {
 	// <code>SUSPENDED</code> Trading has been temporarily suspended due to very
 	// high volatility. When in this status, orders can only be posted as
 	// post-only.<br>
+	// <code>Unknown</code> Trading status is unknown. This could indicate a temporary error
+	// on the market and should resolve shortly.
 	TradingStatus TradingStatus `json:"trading_status"`
 
 	// Volume decimal places
@@ -235,6 +253,9 @@ type OrderV2 struct {
 	// Use this field and `side` to determine credit or debit of funds.
 	Base decimal.Decimal `json:"base"`
 
+	// The base currency account
+	BaseAccountId int64 `json:"base_account_id"`
+
 	// Client Order ID has the value that was passed in when the Order was posted.
 	ClientOrderId string `json:"client_order_id"`
 
@@ -249,6 +270,9 @@ type OrderV2 struct {
 	//
 	// Use this field and `side` to determine credit or debit of funds.
 	Counter decimal.Decimal `json:"counter"`
+
+	// The counter currency account
+	CounterAccountId int64 `json:"counter_account_id"`
 
 	// Time of order creation (Unix milliseconds)
 	CreationTimestamp Time `json:"creation_timestamp"`
@@ -333,42 +357,6 @@ const (
 	SideSell Side = "SELL"
 )
 
-type StatementEntry struct {
-	AccountId string `json:"account_id"`
-
-	// Amount available
-	Available decimal.Decimal `json:"available"`
-
-	// Change in amount available
-	AvailableDelta decimal.Decimal `json:"available_delta"`
-
-	// Account balance
-	Balance decimal.Decimal `json:"balance"`
-
-	// Change in balance
-	BalanceDelta decimal.Decimal `json:"balance_delta"`
-	Currency     string          `json:"currency"`
-
-	// Human-readable description of the transaction.
-	Description  string       `json:"description"`
-	DetailFields DetailFields `json:"detail_fields"`
-
-	// Human-readable label-value attributes.
-	Details map[string]string `json:"details"`
-
-	// The kind of the transaction indicates the transaction flow
-	//
-	// Kinds explained:<br>
-	// <code>FEE</code> when transaction is towards Luno fees<br>
-	// <code>TRANSFER</code> when the transaction is a one way flow of funds, e.g. a deposit or crypto send<br>
-	// <code>EXCHANGE</code> when the transaction is part of a two way exchange, e.g. a trade or instant buy
-	Kind     Kind  `json:"kind"`
-	RowIndex int64 `json:"row_index"`
-
-	// Unix timestamp, in milliseconds
-	Timestamp Time `json:"timestamp"`
-}
-
 type Status string
 
 const (
@@ -419,6 +407,8 @@ type Ticker struct {
 	// <code>POSTONLY</code> when the market has been suspended and only post-only orders will be accepted
 	//
 	// <code>DISABLED</code> when the market is shutdown and no orders can be accepted
+	//
+	// <code>UNKNOWN</code> the market status could not be determined. This is a temporary state.
 	Status Status `json:"status"`
 
 	// Unix timestamp in milliseconds of the tick
@@ -490,6 +480,7 @@ const (
 	TradingStatusPost_only TradingStatus = "POST_ONLY"
 	TradingStatusActive    TradingStatus = "ACTIVE"
 	TradingStatusSuspended TradingStatus = "SUSPENDED"
+	TradingStatusUnknown   TradingStatus = "UNKNOWN"
 )
 
 type Transaction struct {
@@ -515,7 +506,19 @@ type Transaction struct {
 	// Human-readable label-value attributes.
 	Details map[string]string `json:"details"`
 
-	RowIndex int64 `json:"row_index"`
+	// The kind of the transaction indicates the transaction flow
+	//
+	// Kinds explained:<br>
+	// <code>FEE</code> when transaction is towards Luno fees<br>
+	// <code>TRANSFER</code> when the transaction is a one way flow of funds, e.g. a deposit or crypto send<br>
+	// <code>EXCHANGE</code> when the transaction is part of a two way exchange, e.g. a trade or instant buy
+	Kind Kind `json:"kind"`
+
+	// A unique reference for the transaction this statement entry relates to.
+	// There may be multiple statement entries related to the same transaction.
+	// E.g. a withdrawal and the withdrawal fee are two separate statement entries with the same reference.
+	Reference string `json:"reference"`
+	RowIndex  int64  `json:"row_index"`
 
 	// Unix timestamp, in milliseconds
 	Timestamp Time `json:"timestamp"`
@@ -575,21 +578,41 @@ type Withdrawal struct {
 	// Status
 	Status Status `json:"status"`
 
+	// Transfer ID is the identifier of the Withdrawal's transfer once it completes.
+	TransferId string `json:"transfer_id"`
+
 	// Type distinguishes between different withdrawal methods where more than one is supported
 	// for the given currency.
 	Type string `json:"type"`
 }
 
 type beneficiary struct {
-	BankAccountBranch       string `json:"bank_account_branch"`
-	BankAccountNumber       string `json:"bank_account_number"`
-	BankAccountType         string `json:"bank_account_type"`
-	BankCountry             string `json:"bank_country"`
-	BankName                string `json:"bank_name"`
-	BankRecipient           string `json:"bank_recipient"`
-	CreatedAt               Time   `json:"created_at"`
-	Id                      string `json:"id"`
-	SupportsFastWithdrawals bool   `json:"supports_fast_withdrawals"`
+	// Bank branch code
+	BankAccountBranch string `json:"bank_account_branch"`
+
+	// Beneficiary bank account number
+	BankAccountNumber string `json:"bank_account_number"`
+
+	// Bank account type
+	BankAccountType BankAccountType `json:"bank_account_type"`
+
+	// Bank country of origin
+	BankCountry string `json:"bank_country"`
+
+	// Bank SWIFT code
+	BankName string `json:"bank_name"`
+
+	// The owner of the recipient account
+	BankRecipient string `json:"bank_recipient"`
+
+	// Time of beneficiary creation
+	CreatedAt int64 `json:"created_at"`
+
+	// Unique id referencing beneficiary
+	Id string `json:"id"`
+
+	// If the bank account supports fast withdrawals
+	SupportsFastWithdrawals bool `json:"supports_fast_withdrawals"`
 }
 
 // vi: ft=go
